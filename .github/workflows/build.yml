@@ -1,0 +1,235 @@
+name: Build draw.io Tauri App
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "20"
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Build Tauri app for each platform
+  build-tauri:
+    permissions:
+      contents: read
+      attestations: write # required for actions/attest-build-provenance
+      id-token: write # required for Sigstore OIDC token
+    strategy:
+      # Allow the other platform build to finish even if one fails
+      fail-fast: false
+      matrix:
+        include:
+          # Pin to 22.04, not ubuntu-latest: Tauri bundles the runner's glibc, so
+          # building on a newer distro produces binaries that won't run on older
+          # Ubuntu/Debian systems still shipping glibc < 2.35.
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            os-name: linux
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            os-name: windows
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Cache the Cargo registry and compiled dependencies between runs.
+      # The workspaces key tells it where our Cargo project and build output live.
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux dependencies
+        if: matrix.os-name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # cargo-binstall downloads a prebuilt tauri-cli binary instead of compiling
+      # it from source, saving a fair bit of time per runner. Tauri publishes binaries
+      # for all platforms via GitHub Releases, so binstall should always find one.
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install Tauri CLI
+        run: cargo binstall --no-confirm tauri-cli --version "^2"
+
+      - name: Generate icons
+        run: cargo tauri icon drawio/src/main/webapp/images/drawlogo256.png
+
+      - name: Build Tauri app
+        run: cargo tauri build --target ${{ matrix.target }}
+
+      # Collect artifacts for upload and attestation.
+      - name: Collect Linux artifacts
+        if: matrix.os-name == 'linux'
+        run: |
+          mkdir -p artifacts
+          cp src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb artifacts/ 2>/dev/null || true
+          cp src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage artifacts/ 2>/dev/null || true
+          echo "Linux artifacts:"
+          ls -la artifacts/
+
+      - name: Collect Windows artifacts
+        if: matrix.os-name == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts
+          $msi = Get-ChildItem "src-tauri\target\${{ matrix.target }}\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue
+          if (-not $msi) {
+            Write-Error "MSI not found - build may have failed to produce an installer."
+            exit 1
+          }
+          Copy-Item $msi.FullName -Destination artifacts\
+          Write-Host "Windows artifacts:"
+          Get-ChildItem artifacts\
+
+      # Publish a signed SLSA provenance attestation for each artifact so
+      # downloaders can verify the binary was produced by this exact workflow.
+      - name: Generate Sigstore attestations
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifacts/*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: drawio-${{ matrix.os-name }}
+          path: artifacts/
+          retention-days: 30
+
+  # Package for Microsoft Intune (Windows MSI to .intunewin)
+  package-intune:
+    needs: build-tauri
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: drawio-windows
+          path: artifacts/
+
+      - name: Verify MSI exists
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem artifacts\*.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $msi) {
+            Write-Error "No MSI found in windows artifacts, something went wrong with the build step. Cannot proceed with Intune packaging."
+            exit 1
+          }
+          Write-Host "Found MSI: $($msi.FullName)"
+
+      - name: Download Microsoft Win32 Content Prep Tool
+        shell: pwsh
+        run: |
+          $url = "https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/master/IntuneWinAppUtil.exe"
+          Invoke-WebRequest -Uri $url -OutFile IntuneWinAppUtil.exe
+
+      - name: Prepare Intune package source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path intune-source
+
+          $msi = Get-ChildItem artifacts\*.msi | Select-Object -First 1
+          Copy-Item $msi.FullName -Destination intune-source\
+
+          # Copy the maintained Intune scripts into the package source
+          Copy-Item scripts\intune\install.ps1   -Destination intune-source\
+          Copy-Item scripts\intune\uninstall.ps1  -Destination intune-source\
+          Copy-Item scripts\intune\detect.ps1     -Destination intune-source\
+
+          Write-Host "Intune source contents:"
+          Get-ChildItem intune-source\
+
+      - name: Create .intunewin package
+        shell: pwsh
+        run: |
+          # Find the setup file (install.ps1)
+          .\IntuneWinAppUtil.exe `
+            -c intune-source `
+            -s install.ps1 `
+            -o . `
+            -q
+
+          Write-Host "Intune package created:"
+          Get-ChildItem *.intunewin
+
+      - name: Attest .intunewin
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "*.intunewin"
+
+      - name: Upload Intune package
+        uses: actions/upload-artifact@v4
+        with:
+          name: drawio-intune
+          path: "*.intunewin"
+          retention-days: 30
+
+  # Create GitHub Release (only on tag push)
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-tauri, package-intune]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts/
+
+      - name: List all artifacts
+        run: find all-artifacts/ -type f | sort
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Always publish as a draft so artifacts can be reviewed
+          # and the release notes be edited before the release becomes public.
+          draft: true
+          generate_release_notes: true
+          files: |
+            all-artifacts/drawio-windows/*
+            all-artifacts/drawio-linux/*
+            all-artifacts/drawio-intune/*
