@@ -196,8 +196,8 @@ drawio webapp (ElectronApp.js)
 |---------|--------|-------|
 | **Print** | Not implemented | Electron uses `BrowserWindow.webContents.printToPDF()` + hidden window. Tauri/WebView2 has no equivalent. Options: (1) hidden `<iframe>` + SVG → `iframe.contentWindow.print()`, (2) Rust-side `resvg` + `printpdf` for native PDF → system print dialog |
 | **Export to PDF/PNG/SVG via server** | Stub (returns error) | Electron spawns hidden BrowserWindow with `export.js`. Tauri needs alternative rendering pipeline |
-| **System clipboard (image)** | Partial | Text clipboard via `navigator.clipboard`; image clipboard not implemented |
-| **File watching** | Stub | `watchFile`/`unwatchFile` return null. Needs `notify` crate or polling |
+| **System clipboard (image)** | Implemented | `writeImage`/`readImage` via `navigator.clipboard` + `ClipboardItem` API in bridge |
+| **File watching** | Implemented | `notify` crate watches files, emits `file-watch-changed` events via Tauri event system |
 | **Plugin management** | Not implemented | `installPlugin`/`uninstallPlugin`/`getPluginFile` return error |
 | **System font enumeration** | Not implemented | `getLocalFonts` returns empty array. Windows: `EnumFontFamiliesEx` via win32 API |
 | **Spell check toggle** | Stub | `toggleSpellCheck` no-op |

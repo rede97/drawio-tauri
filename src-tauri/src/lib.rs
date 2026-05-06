@@ -1,4 +1,3 @@
-use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use std::path::PathBuf;
@@ -8,7 +7,6 @@ use std::path::Path;
 use base64::Engine;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use notify::{Event, Watcher};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -27,51 +25,6 @@ pub fn run() {
             electron_message
         ])
         .setup(move |app| {
-            // Initialize file watcher for watchFile/unwatchFile
-            let handle = app.handle().clone();
-            let watched: Arc<Mutex<HashMap<String, Option<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
-            let watched_cb = watched.clone();
-
-            let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if !event.kind.is_modify() {
-                        return;
-                    }
-                    for path in &event.paths {
-                        let path_str = path.to_string_lossy().to_string();
-                        if let Ok(meta) = std::fs::metadata(path) {
-                            let mtime = meta.modified().ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_millis() as u64);
-                            let prev = {
-                                let map = watched_cb.lock().unwrap();
-                                map.get(&path_str).copied().flatten()
-                            };
-                            // Update stored mtime
-                            if let Some(entry) = watched_cb.lock().unwrap().get_mut(&path_str) {
-                                *entry = mtime;
-                            }
-
-                            let curr_obj = serde_json::json!({
-                                "size": meta.len(),
-                                "mtime": mtime.unwrap_or(0),
-                            });
-                            let prev_obj = prev.map(|p| serde_json::json!({"size": 0, "mtime": p}))
-                                .unwrap_or(serde_json::json!(null));
-
-                            handle.emit("file-watch-changed", serde_json::json!({
-                                "path": path_str,
-                                "curr": curr_obj,
-                                "prev": prev_obj
-                            })).ok();
-                        }
-                    }
-                }
-            })?;
-
-            let watch_state = FileWatchState::new(watched);
-            *watch_state.watcher.lock().unwrap() = Some(watcher);
-            app.manage(watch_state);
             app.manage(CloseState::new());
 
             let url = "index.html?dev=0&test=0&gapi=0&db=0&od=0&gh=0&gl=0&tr=0&browser=0&picker=0&mode=device&export=https://convert.diagrams.net/node/export&disableUpdate=1&enableSpellCheck=0&enableStoreBkp=1&isGoogleFontsEnabled=0";
@@ -85,11 +38,57 @@ pub fn run() {
                 .initialization_script(bridge_js)
                 .build()?;
 
-            let win_clone = window.clone();
-            let handle2 = app.handle().clone();
+            // File watching via polling (lightweight, no notify/mio deps)
+            let watched: Arc<Mutex<HashMap<String, Option<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
+            let watched_poll = watched.clone();
+            let win_poll = window.clone();
+
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let paths: Vec<String> = {
+                        watched_poll.lock().unwrap().keys().cloned().collect()
+                    };
+                    for path_str in paths {
+                        let path = std::path::PathBuf::from(&path_str);
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            let mtime = meta.modified().ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as u64);
+                            let prev = {
+                                watched_poll.lock().unwrap().get(&path_str).copied().flatten()
+                            };
+                            if mtime != prev {
+                                if let Some(entry) = watched_poll.lock().unwrap().get_mut(&path_str) {
+                                    *entry = mtime;
+                                }
+                                let curr_obj = serde_json::json!({
+                                    "size": meta.len(),
+                                    "mtime": mtime.unwrap_or(0),
+                                });
+                                let prev_obj = prev.map(|p| serde_json::json!({"size": 0, "mtime": p}))
+                                    .unwrap_or(serde_json::json!(null));
+                                let payload = serde_json::json!({
+                                    "path": path_str,
+                                    "curr": curr_obj,
+                                    "prev": prev_obj
+                                });
+                                let js = format!("window.__tauriFileChanged({})", payload);
+                                win_poll.eval(&js).ok();
+                            }
+                        }
+                    }
+                }
+            });
+
+            let watch_state = FileWatchState::new(watched);
+            app.manage(watch_state);
+
+            // Close-requested handler: check for unsaved changes
+            let win_close = window.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    let state = win_clone.app_handle().state::<CloseState>();
+                    let state = win_close.app_handle().state::<CloseState>();
                     {
                         let mut confirmed = state.confirmed.lock().unwrap();
                         if *confirmed {
@@ -98,7 +97,7 @@ pub fn run() {
                         }
                     }
                     api.prevent_close();
-                    handle2.emit("isModified", "close-check").ok();
+                    win_close.eval("window.__tauriCloseCheck()").ok();
                 }
             });
 
@@ -186,7 +185,7 @@ async fn electron_request(
                 );
             }
             let result = builder.blocking_save_file();
-match result {
+	match result {
                 Some(file_path) => {
                     let path = file_path.into_path().map_err(|e| e.to_string())?;
                     Ok(JsonValue::String(path.to_string_lossy().to_string()))
@@ -221,7 +220,7 @@ match result {
             let multiple = msg["multiple"].as_bool().unwrap_or(false);
             if multiple {
                 let result = builder.blocking_pick_files();
-match result {
+	match result {
                     Some(files) => {
                         let paths: Vec<JsonValue> = files.into_iter().filter_map(|f| {
                             f.into_path().ok().map(|p| JsonValue::String(p.to_string_lossy().to_string()))
@@ -232,7 +231,7 @@ match result {
                 }
             } else {
                 let result = builder.blocking_pick_file();
-match result {
+	match result {
                     Some(file_path) => {
                         let path = file_path.into_path().map_err(|e| e.to_string())?;
                         // Electron returns filePaths array → ElectronApp.js expects array
@@ -246,7 +245,7 @@ match result {
         "readFile" => {
             let filename = msg["filename"].as_str().ok_or("missing filename")?;
             let encoding = msg["encoding"].as_str().unwrap_or("utf-8");
-let bytes = fs::read(&filename).map_err(|e| e.to_string())?;
+	let bytes = fs::read(&filename).map_err(|e| e.to_string())?;
             if encoding == "base64" {
                 Ok(JsonValue::String(base64::engine::general_purpose::STANDARD.encode(&bytes)))
             } else {
@@ -258,7 +257,7 @@ let bytes = fs::read(&filename).map_err(|e| e.to_string())?;
             let path = msg["path"].as_str().ok_or("missing path")?;
             let data = msg["data"].as_str().ok_or("missing data")?;
             let enc = msg["enc"].as_str().unwrap_or("utf-8");
-if enc == "base64" {
+	if enc == "base64" {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .map_err(|e| e.to_string())?;
@@ -274,7 +273,7 @@ if enc == "base64" {
             let path = file_object["path"].as_str().ok_or("missing fileObject.path")?;
             let data = msg["data"].as_str().ok_or("missing data")?;
             let def_enc = msg["defEnc"].as_str().unwrap_or("utf-8");
-if def_enc == "base64" {
+	if def_enc == "base64" {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .map_err(|e| e.to_string())?;
@@ -374,16 +373,11 @@ if def_enc == "base64" {
             let path = msg["path"].as_str().ok_or("missing path")?.to_string();
             let path_buf = std::path::PathBuf::from(&path);
             if path_buf.exists() {
-                // Store initial mtime
                 if let Ok(meta) = std::fs::metadata(&path_buf) {
                     let mtime = meta.modified().ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_millis() as u64);
-                    state.watch_path(path.clone(), mtime);
-                }
-                // Add to fs watcher
-                if let Some(ref mut w) = *state.watcher.lock().unwrap() {
-                    w.watch(&path_buf, notify::RecursiveMode::NonRecursive).ok();
+                    state.watch_path(path, mtime);
                 }
             }
             Ok(JsonValue::Null)
@@ -391,11 +385,7 @@ if def_enc == "base64" {
 
         "unwatchFile" => {
             let path = msg["path"].as_str().unwrap_or("");
-            let path_buf = std::path::PathBuf::from(path);
             state.unwatch_path(path);
-            if let Some(ref mut w) = *state.watcher.lock().unwrap() {
-                w.unwatch(&path_buf).ok();
-            }
             Ok(JsonValue::Null)
         }
 
@@ -404,7 +394,6 @@ if def_enc == "base64" {
         }
 
         "getLocalFonts" => {
-            // Return empty; local font enumeration requires OS-specific code
             Ok(JsonValue::Array(vec![]))
         }
 
@@ -444,22 +433,22 @@ async fn electron_message(
         }
 
         "app-load-finished" => {
-            // ElectronApp.js signals it's ready → emit args back
             let args: Vec<String> = std::env::args().collect();
-            window.emit("args-obj", serde_json::json!({ "args": args, "cwd": std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()).unwrap_or_default() })).ok();
+            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let payload = serde_json::json!({ "args": args, "cwd": cwd });
+            let js = format!("window.__tauriArgsObj({})", payload);
+            window.eval(&js).ok();
         }
 
         "export" => {
-            // Export is complex: Electron spawns hidden BrowserWindow.
-            // For now, stub — export will use browser-based fallback.
-            window.emit("export-error", serde_json::json!({
+            let payload = serde_json::json!({
                 "message": "Export via Tauri bridge not yet implemented. Use browser export."
-            })).ok();
+            });
+            let js = format!("window.__tauriExportError({})", payload);
+            window.eval(&js).ok();
         }
 
-        "checkForUpdates" | "toggleSpellCheck" | "toggleStoreBkp" | "toggleGoogleFonts" => {
-            // Stub: settings toggles not yet wired
-        }
+        "checkForUpdates" | "toggleSpellCheck" | "toggleStoreBkp" | "toggleGoogleFonts" => {}
 
         "newfile" => {
             window.eval("location.reload()").ok();
@@ -469,23 +458,21 @@ async fn electron_message(
             let data = &_data;
             if data["isModified"].as_bool().unwrap_or(false) {
                 let result = app.dialog()
-                    .message("Do you want to save your changes before closing?")
+                    .message("You have unsaved changes. Discard them?")
                     .title("draw.io")
                     .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-                    .buttons(tauri_plugin_dialog::MessageDialogButtons::YesNo)
-                    .parent(&window)
+                    .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                        "Discard Changes".into(), "Cancel".into()))
                     .blocking_show();
                 if result {
-                    // User chose Yes/Save — emit event to JS, it saves, then calls save-complete
-                    window.emit("save-and-close", "").ok();
-                } else {
-                    // User chose No/Don't Save — close
+                    // User clicked "Discard Changes" → close
                     {
                         let state = app.state::<CloseState>();
                         *state.confirmed.lock().unwrap() = true;
                     }
                     window.close().ok();
                 }
+                // Cancel → do nothing, let user continue editing
             } else {
                 {
                     let state = app.state::<CloseState>();
@@ -503,9 +490,7 @@ async fn electron_message(
             window.close().ok();
         }
 
-        "draftRemoved" => {
-            // Handled by JS-side listeners via the event system
-        }
+        "draftRemoved" => {}
 
         _ => {}
     }
@@ -518,7 +503,6 @@ fn draft_dir(file_path: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| Path::new(".").to_path_buf())
         .join("drawio")
         .join("drafts");
-    // Use hash of file path as subdirectory
     let hash = format!("{:x}", md5_like_hash(file_path));
     base.join(hash)
 }
@@ -546,17 +530,12 @@ impl CloseState {
 // ── File watching state ────────────────────────────────────────────────────
 
 struct FileWatchState {
-    watcher: Mutex<Option<notify::RecommendedWatcher>>,
-    /// path → last known mtime (for detecting changes)
     watched: Arc<Mutex<HashMap<String, Option<u64>>>>,
 }
 
 impl FileWatchState {
     fn new(watched: Arc<Mutex<HashMap<String, Option<u64>>>>) -> Self {
-        Self {
-            watcher: Mutex::new(None),
-            watched,
-        }
+        Self { watched }
     }
 
     fn watch_path(&self, path: String, mtime: Option<u64>) {

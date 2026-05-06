@@ -13,6 +13,7 @@
 	var invoke = window.__TAURI_INTERNALS__.invoke;
 	var _listeners = {};
 	var _onceListeners = {};
+	var _fileWatchListeners = {};
 
 	function _emit(channel, data) {
 		(_listeners[channel] || []).forEach(function(cb) { try { cb(data); } catch(e) {} });
@@ -20,6 +21,44 @@
 			_onceListeners[channel].forEach(function(cb) { try { cb(data); } catch(e) {} });
 			delete _onceListeners[channel];
 		}
+	}
+
+	// file-watch-changed event: dispatch to registered per-path listeners
+	_listeners['file-watch-changed'] = [function(payload) {
+		var path = payload && payload.path;
+		var cb = path && _fileWatchListeners[path];
+		if (cb) {
+			try { cb(payload.curr, payload.prev); } catch(e) {}
+		}
+	}];
+
+	// save-and-close event: trigger save, then signal Rust to close window
+	_listeners['save-and-close'] = [function() {
+		var editorUi = window.editorUi;
+		if (!editorUi) { window.electron.sendMessage('save-complete'); return; }
+		var file = editorUi.getCurrentFile();
+		if (!file) { window.electron.sendMessage('save-complete'); return; }
+		file.save(false, function() {
+			window.electron.sendMessage('save-complete');
+		}, function() {
+			window.electron.sendMessage('save-complete');
+		});
+	}];
+
+	function _dataUrlToBlob(dataUrl) {
+		var parts = dataUrl.split(',');
+		var mime = parts[0].match(/:(.*?);/)[1];
+		var raw = atob(parts[1]);
+		var bytes = new Uint8Array(raw.length);
+		for (var i = 0; i < raw.length; i++) { bytes[i] = raw.charCodeAt(i); }
+		return new Blob([bytes], { type: mime });
+	}
+
+	function _blobToDataUrl(blob, cb) {
+		var reader = new FileReader();
+		reader.onload = function() { cb(null, reader.result); };
+		reader.onerror = function(e) { cb(e); };
+		reader.readAsDataURL(blob);
 	}
 
 	function _normalizeFilters(filters) {
@@ -32,23 +71,91 @@
 		});
 	}
 
+	// Bridge functions callable from Rust via window.eval()
+	// Each maps to _emit() which dispatches to registered listeners
+	window.__tauriCloseCheck = function() { _emit('isModified', 'close-check'); };
+	window.__tauriSaveAndClose = function() { _emit('save-and-close'); };
+	window.__tauriFileChanged = function(data) { _emit('file-watch-changed', data); };
+	window.__tauriArgsObj = function(data) { _emit('args-obj', data); };
+	window.__tauriExportError = function(data) { _emit('export-error', data); };
+
 	window.electron = {
 		request: function(msg, success, error) {
 			if (typeof msg === 'string') msg = { action: msg };
 
 			// Clipboard actions handled via navigator.clipboard (webview native)
 			if (msg.action === 'clipboardAction') {
-				if (msg.clipboardAction === 'readText') {
+				var method = msg.method || msg.clipboardAction;
+
+				if (method === 'readText') {
 					navigator.clipboard.readText()
 						.then(function(t) { if (success) success(t); })
 						.catch(function(e) { if (error) error(e); });
-				} else if (msg.clipboardAction === 'writeText') {
+				} else if (method === 'writeText') {
 					navigator.clipboard.writeText(msg.data || '')
 						.then(function() { if (success) success(null); })
 						.catch(function(e) { if (error) error(e); });
+				} else if (method === 'writeImage') {
+					try {
+						var imgData = msg.data || {};
+						var blob = _dataUrlToBlob(imgData.dataUrl);
+						navigator.clipboard.write([new ClipboardItem((_b = {}, _b[blob.type] = blob, _b))])
+							.then(function() { if (success) success(null); })
+							.catch(function(e) { if (error) error(e); });
+						var _b;
+					} catch(e) {
+						if (error) error(e.message || 'writeImage failed');
+					}
+				} else if (method === 'readImage') {
+					try {
+						navigator.clipboard.read()
+							.then(function(items) {
+								for (var i = 0; i < items.length; i++) {
+									for (var j = 0; j < items[i].types.length; j++) {
+										var t = items[i].types[j];
+										if (t.indexOf('image/') === 0) {
+											return items[i].getType(t).then(function(blob) {
+												_blobToDataUrl(blob, function(err, dataUrl) {
+													if (err) { if (error) error(err); return; }
+													if (success) success(dataUrl);
+												});
+											});
+										}
+									}
+								}
+								if (success) success(null);
+							})
+							.catch(function(e) { if (error) error(e); });
+					} catch(e) {
+						if (error) error(e.message || 'readImage failed');
+					}
 				} else {
-					if (error) error('Unsupported clipboard action: ' + msg.clipboardAction);
+					if (error) error('Unsupported clipboard action: ' + method);
 				}
+				return;
+			}
+
+			// watchFile: store listener JS-side, then forward to Rust (without listener)
+			if (msg.action === 'watchFile') {
+				if (msg.listener) {
+					_fileWatchListeners[msg.path] = msg.listener;
+				}
+				invoke('electron_request', { msg: { action: 'watchFile', path: msg.path } })
+					.then(function(r) { if (success) success(r); })
+					.catch(function(e) {
+						if (error) error(typeof e === 'string' ? e : (e.message || 'Unknown error'), e);
+					});
+				return;
+			}
+
+			// unwatchFile: remove listener JS-side, then forward to Rust
+			if (msg.action === 'unwatchFile') {
+				delete _fileWatchListeners[msg.path || msg.file];
+				invoke('electron_request', { msg: { action: 'unwatchFile', path: msg.path || msg.file } })
+					.then(function(r) { if (success) success(r); })
+					.catch(function(e) {
+						if (error) error(typeof e === 'string' ? e : (e.message || 'Unknown error'), e);
+					});
 				return;
 			}
 
