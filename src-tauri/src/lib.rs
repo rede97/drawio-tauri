@@ -6,6 +6,9 @@ use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::Path;
 use base64::Engine;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use notify::{Event, Watcher};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -19,14 +22,61 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             read_file_bytes,
             write_file_bytes,
-            get_app_version,
+            getapp_version,
             electron_request,
             electron_message
         ])
         .setup(move |app| {
+            // Initialize file watcher for watchFile/unwatchFile
+            let handle = app.handle().clone();
+            let watched: Arc<Mutex<HashMap<String, Option<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
+            let watched_cb = watched.clone();
+
+            let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if !event.kind.is_modify() {
+                        return;
+                    }
+                    for path in &event.paths {
+                        let path_str = path.to_string_lossy().to_string();
+                        if let Ok(meta) = std::fs::metadata(path) {
+                            let mtime = meta.modified().ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as u64);
+                            let prev = {
+                                let map = watched_cb.lock().unwrap();
+                                map.get(&path_str).copied().flatten()
+                            };
+                            // Update stored mtime
+                            if let Some(entry) = watched_cb.lock().unwrap().get_mut(&path_str) {
+                                *entry = mtime;
+                            }
+
+                            let curr_obj = serde_json::json!({
+                                "size": meta.len(),
+                                "mtime": mtime.unwrap_or(0),
+                            });
+                            let prev_obj = prev.map(|p| serde_json::json!({"size": 0, "mtime": p}))
+                                .unwrap_or(serde_json::json!(null));
+
+                            handle.emit("file-watch-changed", serde_json::json!({
+                                "path": path_str,
+                                "curr": curr_obj,
+                                "prev": prev_obj
+                            })).ok();
+                        }
+                    }
+                }
+            })?;
+
+            let watch_state = FileWatchState::new(watched);
+            *watch_state.watcher.lock().unwrap() = Some(watcher);
+            app.manage(watch_state);
+            app.manage(CloseState::new());
+
             let url = "index.html?dev=0&test=0&gapi=0&db=0&od=0&gh=0&gl=0&tr=0&browser=0&picker=0&mode=device&export=https://convert.diagrams.net/node/export&disableUpdate=1&enableSpellCheck=0&enableStoreBkp=1&isGoogleFontsEnabled=0";
 
-            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
+            let window = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
                 .title("draw.io")
                 .inner_size(1280.0, 800.0)
                 .min_inner_size(800.0, 600.0)
@@ -34,6 +84,23 @@ pub fn run() {
                 .fullscreen(false)
                 .initialization_script(bridge_js)
                 .build()?;
+
+            let win_clone = window.clone();
+            let handle2 = app.handle().clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    let state = win_clone.app_handle().state::<CloseState>();
+                    {
+                        let mut confirmed = state.confirmed.lock().unwrap();
+                        if *confirmed {
+                            *confirmed = false;
+                            return; // allow close
+                        }
+                    }
+                    api.prevent_close();
+                    handle2.emit("isModified", "close-check").ok();
+                }
+            });
 
             Ok(())
         })
@@ -55,7 +122,7 @@ async fn write_file_bytes(path: String, contents: Vec<u8>) -> Result<(), String>
 
 /// Return the app version
 #[tauri::command]
-fn get_app_version() -> String {
+fn getapp_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
@@ -65,7 +132,8 @@ fn get_app_version() -> String {
 #[tauri::command]
 async fn electron_request(
     msg: JsonValue,
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, FileWatchState>,
 ) -> Result<JsonValue, String> {
     let action = msg["action"].as_str().unwrap_or("");
 
@@ -93,8 +161,8 @@ async fn electron_request(
         }
 
         "showSaveDialog" => {
-            let mut builder = _app.dialog().file();
-            builder = builder.set_parent(&_app.get_webview_window("main").unwrap());
+            let mut builder = app.dialog().file();
+            builder = builder.set_parent(&app.get_webview_window("main").unwrap());
             if let Some(title) = msg["title"].as_str() {
                 builder = builder.set_title(title);
             }
@@ -128,8 +196,8 @@ match result {
         }
 
         "showOpenDialog" => {
-            let mut builder = _app.dialog().file();
-            builder = builder.set_parent(&_app.get_webview_window("main").unwrap());
+            let mut builder = app.dialog().file();
+            builder = builder.set_parent(&app.get_webview_window("main").unwrap());
             if let Some(title) = msg["title"].as_str() {
                 builder = builder.set_title(title);
             }
@@ -302,8 +370,32 @@ if def_enc == "base64" {
 
         "isPluginsEnabled" => Ok(JsonValue::Bool(true)),
 
-        "watchFile" | "unwatchFile" => {
-            // File watching not yet implemented in Tauri
+        "watchFile" => {
+            let path = msg["path"].as_str().ok_or("missing path")?.to_string();
+            let path_buf = std::path::PathBuf::from(&path);
+            if path_buf.exists() {
+                // Store initial mtime
+                if let Ok(meta) = std::fs::metadata(&path_buf) {
+                    let mtime = meta.modified().ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64);
+                    state.watch_path(path.clone(), mtime);
+                }
+                // Add to fs watcher
+                if let Some(ref mut w) = *state.watcher.lock().unwrap() {
+                    w.watch(&path_buf, notify::RecursiveMode::NonRecursive).ok();
+                }
+            }
+            Ok(JsonValue::Null)
+        }
+
+        "unwatchFile" => {
+            let path = msg["path"].as_str().unwrap_or("");
+            let path_buf = std::path::PathBuf::from(path);
+            state.unwatch_path(path);
+            if let Some(ref mut w) = *state.watcher.lock().unwrap() {
+                w.unwatch(&path_buf).ok();
+            }
             Ok(JsonValue::Null)
         }
 
@@ -325,6 +417,7 @@ if def_enc == "base64" {
 async fn electron_message(
     channel: String,
     _data: JsonValue,
+    app: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     match channel.as_str() {
@@ -334,6 +427,7 @@ async fn electron_message(
         }
 
         "openDevTools" => {
+            #[cfg(debug_assertions)]
             window.open_devtools();
         }
 
@@ -371,7 +465,45 @@ async fn electron_message(
             window.eval("location.reload()").ok();
         }
 
-        "isModified-result" | "draftRemoved" => {
+        "isModified-result" => {
+            let data = &_data;
+            if data["isModified"].as_bool().unwrap_or(false) {
+                let result = app.dialog()
+                    .message("Do you want to save your changes before closing?")
+                    .title("draw.io")
+                    .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                    .buttons(tauri_plugin_dialog::MessageDialogButtons::YesNo)
+                    .parent(&window)
+                    .blocking_show();
+                if result {
+                    // User chose Yes/Save — emit event to JS, it saves, then calls save-complete
+                    window.emit("save-and-close", "").ok();
+                } else {
+                    // User chose No/Don't Save — close
+                    {
+                        let state = app.state::<CloseState>();
+                        *state.confirmed.lock().unwrap() = true;
+                    }
+                    window.close().ok();
+                }
+            } else {
+                {
+                    let state = app.state::<CloseState>();
+                    *state.confirmed.lock().unwrap() = true;
+                }
+                window.close().ok();
+            }
+        }
+
+        "save-complete" => {
+            {
+                let state = app.state::<CloseState>();
+                *state.confirmed.lock().unwrap() = true;
+            }
+            window.close().ok();
+        }
+
+        "draftRemoved" => {
             // Handled by JS-side listeners via the event system
         }
 
@@ -397,4 +529,41 @@ fn md5_like_hash(s: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
+}
+
+// ── Close-confirmation state ───────────────────────────────────────────────
+
+struct CloseState {
+    confirmed: Mutex<bool>,
+}
+
+impl CloseState {
+    fn new() -> Self {
+        Self { confirmed: Mutex::new(false) }
+    }
+}
+
+// ── File watching state ────────────────────────────────────────────────────
+
+struct FileWatchState {
+    watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// path → last known mtime (for detecting changes)
+    watched: Arc<Mutex<HashMap<String, Option<u64>>>>,
+}
+
+impl FileWatchState {
+    fn new(watched: Arc<Mutex<HashMap<String, Option<u64>>>>) -> Self {
+        Self {
+            watcher: Mutex::new(None),
+            watched,
+        }
+    }
+
+    fn watch_path(&self, path: String, mtime: Option<u64>) {
+        self.watched.lock().unwrap().insert(path, mtime);
+    }
+
+    fn unwatch_path(&self, path: &str) {
+        self.watched.lock().unwrap().remove(path);
+    }
 }
