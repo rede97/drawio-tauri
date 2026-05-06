@@ -6,7 +6,7 @@ Draw.io Tauri is a Tauri-based desktop application that wraps the core draw.io d
 
 **Repository:** https://github.com/lumilla/drawio-tauri
 **License:** Apache 2.0
-**Current Version:** 29.5.2
+**Current Version:** 29.7.11
 
 ## Quick Reference
 
@@ -165,3 +165,45 @@ Defined in `src-tauri/src/lib.rs`:
 | `@tauri-apps/plugin-dialog` | Dialog plugin JS bindings |
 | `@tauri-apps/plugin-fs` | FS plugin JS bindings |
 | `@tauri-apps/plugin-shell` | Shell plugin JS bindings |
+
+## Electron Bridge (Desktop Mode)
+
+The app uses `electron_bridge.js` (injected via `with_initialization_script()`) to make the webapp detect as a desktop app and maps `electron.*` API calls to Tauri IPC. This allows `ElectronApp.js` to load, enabling native file dialogs, menus, and other desktop features.
+
+### IPC Commands (Bridge)
+
+Defined in `src-tauri/src/lib.rs`:
+
+| Command | Purpose |
+|---------|---------|
+| `electron_request` | Handles `electron.request()` — file I/O, dialogs, file stats, drafts, plugins |
+| `electron_message` | Handles `electron.sendMessage()` — fullscreen, zoom, devtools, app events |
+
+### Bridge Architecture
+
+```
+drawio webapp (ElectronApp.js)
+    → electron.request() / electron.sendMessage()
+    → electron_bridge.js (init script, injected before page load)
+    → Tauri IPC invoke()
+    → Rust electron_request / electron_message handlers
+    → Tauri plugins (dialog, fs, shell) / native Rust fs
+```
+
+### Unimplemented Features (TODO)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Print** | Not implemented | Electron uses `BrowserWindow.webContents.printToPDF()` + hidden window. Tauri/WebView2 has no equivalent. Options: (1) hidden `<iframe>` + SVG → `iframe.contentWindow.print()`, (2) Rust-side `resvg` + `printpdf` for native PDF → system print dialog |
+| **Export to PDF/PNG/SVG via server** | Stub (returns error) | Electron spawns hidden BrowserWindow with `export.js`. Tauri needs alternative rendering pipeline |
+| **System clipboard (image)** | Partial | Text clipboard via `navigator.clipboard`; image clipboard not implemented |
+| **File watching** | Stub | `watchFile`/`unwatchFile` return null. Needs `notify` crate or polling |
+| **Plugin management** | Not implemented | `installPlugin`/`uninstallPlugin`/`getPluginFile` return error |
+| **System font enumeration** | Not implemented | `getLocalFonts` returns empty array. Windows: `EnumFontFamiliesEx` via win32 API |
+| **Spell check toggle** | Stub | `toggleSpellCheck` no-op |
+| **Google Fonts toggle** | Stub | `toggleGoogleFonts` no-op |
+| **Store backup toggle** | Stub | `toggleStoreBkp` no-op |
+| **Check for updates** | Stub | `checkForUpdates` no-op |
+| **VSDX import via IPC** | Not implemented | Electron uses node.js to parse VSDX; Tauri needs Rust-side parser |
+| **Command-line file args** | Partial | `args-obj` emitted on startup but file-to-open flow not fully tested |
+| **Window zoom (native)** | Via CSS | `zoomIn`/`zoomOut`/`resetZoom` use `document.body.style.zoom` (not native) |
