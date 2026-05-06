@@ -433,7 +433,7 @@ async fn electron_message(
         }
 
         "app-load-finished" => {
-            let args: Vec<String> = std::env::args().collect();
+            let args: Vec<String> = std::env::args().skip(1).collect();
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
             let payload = serde_json::json!({ "args": args, "cwd": cwd });
             let js = format!("window.__tauriArgsObj({})", payload);
