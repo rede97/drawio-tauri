@@ -1,6 +1,6 @@
 [package]
 name = "drawio"
-version = "29.7.11"
+version = "29.7.12"
 description = "draw.io desktop - Diagram editor"
 authors = ["JGraph"]
 edition = "2021"
