@@ -1,6 +1,6 @@
 {
   "name": "draw.io",
-  "version": "29.7.12",
+  "version": "29.7.13",
   "description": "draw.io desktop (Tauri)",
   "type": "module",
   "engines": {

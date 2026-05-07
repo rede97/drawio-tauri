@@ -114,7 +114,8 @@ jobs:
           Copy-Item $msi.FullName -Destination artifacts\
           $nsis = Get-ChildItem "src-tauri\target\${{ matrix.target }}\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue
           if ($nsis) {
-            Copy-Item $nsis.FullName -Destination artifacts\
+            $nsisName = [System.IO.Path]::GetFileNameWithoutExtension($nsis.FullName) + "_user-mode.exe"
+            Copy-Item $nsis.FullName -Destination (Join-Path artifacts $nsisName)
           } else {
             Write-Warning "NSIS installer not found - bundle target may not have produced one."
           }
