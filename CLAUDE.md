@@ -216,3 +216,11 @@ User preferences stored as JSON at `<data_local_dir>/drawio/prefs.json`. Fields:
 - `spellCheck` (bool) — controlled by Extras → Spell Check
 
 Toggling either shows "restart required" alert (webapp-side). New values take effect on next launch.
+
+### Bridge init script (`electron_bridge.js`)
+
+Injected via `with_initialization_script()` before webapp loads. Besides the core Electron→Tauri IPC bridge, it also:
+
+- **Startup splash**: Clears stale `.draft_*` entries from IndexedDB on launch, ensuring the "create new / open existing" splash dialog always appears instead of auto-restoring a previous unsaved draft
+- **System fonts**: Sets `window.DRAWIO_CONFIG = { enableLocalFonts: true }` so the webapp calls `getLocalFonts` and populates the font name input's autocomplete datalist (note: system fonts appear as typing suggestions, not in the font family dropdown)
+- **Spellcheck**: When `enableSpellCheck=1` in URL params, a MutationObserver forces `spellcheck="true"` on all text inputs/editable elements, overriding draw.io's hardcoded `spellcheck="false"`

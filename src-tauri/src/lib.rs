@@ -568,6 +568,8 @@ async fn electron_message(
             let payload = serde_json::json!({ "args": args, "cwd": cwd });
             let js = format!("window.__tauriArgsObj({})", payload);
             window.eval(&js).ok();
+            // Override Help → Website link to fork homepage
+            window.eval("try{var a=editorUi&&editorUi.actions;if(a){a.addAction('website...',function(){editorUi.openLink('https://github.com/rede97/drawio-tauri')})}}catch(e){}").ok();
         }
 
         "export" => {

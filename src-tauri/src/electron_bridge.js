@@ -2,6 +2,28 @@
 // Injected via with_initialization_script() before webapp loads.
 // Makes draw.io detect as desktop app and maps electron.* API to Tauri IPC.
 
+window.DRAWIO_CONFIG = { enableLocalFonts: true };
+
+// Clear stale IndexedDB drafts so splash screen always shows on startup
+(function() {
+	try {
+		var req = indexedDB.open('database', 2);
+		req.onsuccess = function(e) {
+			var db = e.target.result;
+			var tx = db.transaction(['objects'], 'readwrite');
+			var store = tx.objectStore('objects');
+			var cr = store.openCursor();
+			cr.onsuccess = function(e) {
+				var c = e.target.result;
+				if (c) {
+					if (c.key.toString().indexOf('.draft_') === 0) { c.delete(); }
+					c.continue();
+				}
+			};
+		};
+	} catch(e) {}
+})();
+
 (function() {
 	var _ua = navigator.userAgent;
 	Object.defineProperty(navigator, 'userAgent', {
