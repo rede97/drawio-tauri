@@ -14,7 +14,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git@github.com:jgraph/drawio-desktop.git"
+    "url": "git@github.com:rede97/drawio-tauri.git"
   },
   "keywords": [
     "draw.io",
@@ -22,12 +22,12 @@
     "flowchart",
     "UML"
   ],
-  "author": "JGraph <support@draw.io>",
+  "author": "rede97",
   "license": "Apache-2.0",
   "bugs": {
-    "url": "https://github.com/jgraph/drawio-desktop/issues"
+    "url": "https://github.com/rede97/drawio-tauri/issues"
   },
-  "homepage": "https://github.com/jgraph/drawio",
+  "homepage": "https://github.com/rede97/drawio-tauri",
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",

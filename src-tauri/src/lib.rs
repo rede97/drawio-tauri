@@ -27,7 +27,7 @@ pub fn run() {
         .setup(move |app| {
             app.manage(CloseState::new());
 
-            let url = "index.html?dev=0&test=0&gapi=0&db=0&od=0&gh=0&gl=0&tr=0&browser=0&picker=0&mode=device&export=https://convert.diagrams.net/node/export&disableUpdate=1&enableSpellCheck=0&enableStoreBkp=1&isGoogleFontsEnabled=0";
+            let url = "index.html?dev=0&test=0&gapi=0&db=0&od=0&gh=0&gl=0&tr=0&browser=0&picker=0&mode=device&export=https://convert.diagrams.net/node/export&disableUpdate=0&enableSpellCheck=0&enableStoreBkp=1&isGoogleFontsEnabled=0";
 
             let window = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
                 .title("draw.io")
@@ -448,7 +448,55 @@ async fn electron_message(
             window.eval(&js).ok();
         }
 
-        "checkForUpdates" | "toggleSpellCheck" | "toggleStoreBkp" | "toggleGoogleFonts" => {}
+        "checkForUpdates" => {
+            let current = env!("CARGO_PKG_VERSION");
+            let resp = ureq::get("https://api.github.com/repos/rede97/drawio-tauri/releases/latest")
+                .set("User-Agent", "drawio-tauri")
+                .set("Accept", "application/vnd.github+json")
+                .call();
+            match resp {
+                Ok(r) => {
+                    if let Ok(json) = r.into_json::<serde_json::Value>() {
+                        let tag = json["tag_name"].as_str().unwrap_or("");
+                        let latest = tag.trim_start_matches('v');
+                        let html_url = json["html_url"].as_str().unwrap_or(
+                            "https://github.com/rede97/drawio-tauri/releases"
+                        );
+                        if is_newer_version(latest, current) {
+                            let msg = format!(
+                                "A new version {} is available.\nCurrent version: {}\n\n{}",
+                                latest, current, html_url
+                            );
+                            let clicked = app.dialog()
+                                .message(msg)
+                                .title("Update Available")
+                                .kind(tauri_plugin_dialog::MessageDialogKind::Info)
+                                .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                                    "Download".into(), "Later".into()))
+                                .blocking_show();
+                            if clicked {
+                                tauri_plugin_opener::open_url(html_url.to_string(), None::<&str>).ok();
+                            }
+                        } else {
+                            app.dialog()
+                                .message("You are running the latest version.")
+                                .title("No Updates")
+                                .kind(tauri_plugin_dialog::MessageDialogKind::Info)
+                                .blocking_show();
+                        }
+                    }
+                }
+                Err(_) => {
+                    app.dialog()
+                        .message("Failed to check for updates. Please try again later.")
+                        .title("Update Check Failed")
+                        .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+                        .blocking_show();
+                }
+            }
+        }
+
+        "toggleSpellCheck" | "toggleStoreBkp" | "toggleGoogleFonts" => {}
 
         "newfile" => {
             window.eval("location.reload()").ok();
@@ -505,6 +553,18 @@ fn draft_dir(file_path: &str) -> std::path::PathBuf {
         .join("drafts");
     let hash = format!("{:x}", md5_like_hash(file_path));
     base.join(hash)
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> {
+        v.split('.').filter_map(|s| s.parse::<u32>().ok()).collect()
+    };
+    let a = parse(latest);
+    let b = parse(current);
+    if a.is_empty() || b.is_empty() {
+        return latest != current;
+    }
+    a > b
 }
 
 fn md5_like_hash(s: &str) -> u64 {
