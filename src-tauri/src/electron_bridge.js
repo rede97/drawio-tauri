@@ -191,4 +191,35 @@
 		}
 		return _origPM.apply(this, arguments);
 	};
+
+	// Spellcheck: override draw.io's spellcheck="false" on text elements when enabled
+	(function() {
+		var search = window.location.search;
+		if (search.indexOf('enableSpellCheck=1') !== -1 || search.indexOf('enableSpellCheck=1&') !== -1 || search.indexOf('&enableSpellCheck=1') !== -1) {
+			function enableSpellcheck(el) {
+				el.setAttribute('spellcheck', 'true');
+			}
+			function scan(root) {
+				if (root.nodeType === 1) {
+					if (root.matches && root.matches('input, textarea, [contenteditable]')) {
+						enableSpellcheck(root);
+					}
+					var list = root.querySelectorAll && root.querySelectorAll('input, textarea, [contenteditable]');
+					if (list) {
+						for (var i = 0; i < list.length; i++) { enableSpellcheck(list[i]); }
+					}
+				}
+			}
+			document.addEventListener('DOMContentLoaded', function() {
+				var observer = new MutationObserver(function(mutations) {
+					for (var i = 0; i < mutations.length; i++) {
+						var added = mutations[i].addedNodes;
+						for (var j = 0; j < added.length; j++) { scan(added[j]); }
+					}
+				});
+				observer.observe(document.documentElement, { childList: true, subtree: true });
+				scan(document.documentElement);
+			});
+		}
+	})();
 })();

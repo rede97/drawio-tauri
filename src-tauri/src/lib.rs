@@ -8,9 +8,136 @@ use base64::Engine;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct Prefs {
+    #[serde(rename = "googleFonts")]
+    is_google_fonts_enabled: bool,
+    #[serde(rename = "spellCheck")]
+    enable_spell_check: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            is_google_fonts_enabled: false,
+            enable_spell_check: false,
+        }
+    }
+}
+
+struct PrefsState {
+    prefs: Mutex<Prefs>,
+}
+
+impl PrefsState {
+    fn new(prefs: Prefs) -> Self {
+        Self { prefs: Mutex::new(prefs) }
+    }
+}
+
+fn prefs_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| Path::new(".").to_path_buf())
+        .join("drawio")
+        .join("prefs.json")
+}
+
+fn load_prefs() -> Prefs {
+    let path = prefs_path();
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_prefs(prefs: &Prefs) {
+    let path = prefs_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    if let Ok(json) = serde_json::to_string_pretty(prefs) {
+        fs::write(&path, json).ok();
+    }
+}
+
+fn get_local_fonts() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(out) = std::process::Command::new("reg")
+            .args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut fonts: Vec<String> = text.lines()
+                .filter_map(|line| {
+                    if !line.contains("REG_SZ") { return None; }
+                    let name = line.split("REG_SZ").next()?.trim().to_string();
+                    if name.is_empty() || name.starts_with("HKEY_") { return None; }
+                    Some(name
+                        .replace(" (TrueType)", "")
+                        .replace(" (OpenType)", "")
+                        .trim()
+                        .to_string())
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            fonts.sort();
+            fonts.dedup();
+            return fonts;
+        }
+        Vec::new()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(out) = std::process::Command::new("fc-list")
+            .args([":", "family"])
+            .output()
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let mut fonts: Vec<String> = text.lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                fonts.sort();
+                fonts.dedup();
+                return fonts;
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut fonts = Vec::new();
+            for dir in &["/System/Library/Fonts", "/Library/Fonts"] {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if let Some(dot) = name.rfind('.') {
+                            fonts.push(name[..dot].to_string());
+                        }
+                    }
+                }
+            }
+            fonts.sort();
+            fonts.dedup();
+            fonts
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let bridge_js = include_str!("electron_bridge.js");
+    let prefs = load_prefs();
+    let gf = if prefs.is_google_fonts_enabled { "1" } else { "0" };
+    let sc = if prefs.enable_spell_check { "1" } else { "0" };
+    let url = format!("index.html?dev=0&test=0&gapi=0&db=0&od=0&gh=0&gl=0&tr=0&browser=0&picker=0&mode=device&export=https://convert.diagrams.net/node/export&disableUpdate=0&enableSpellCheck={sc}&enableStoreBkp=1&isGoogleFontsEnabled={gf}");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -26,10 +153,9 @@ pub fn run() {
         ])
         .setup(move |app| {
             app.manage(CloseState::new());
+            app.manage(PrefsState::new(prefs.clone()));
 
-            let url = "index.html?dev=0&test=0&gapi=0&db=0&od=0&gh=0&gl=0&tr=0&browser=0&picker=0&mode=device&export=https://convert.diagrams.net/node/export&disableUpdate=0&enableSpellCheck=0&enableStoreBkp=1&isGoogleFontsEnabled=0";
-
-            let window = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
+            let window = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.clone().into()))
                 .title("draw.io")
                 .inner_size(1280.0, 800.0)
                 .min_inner_size(800.0, 600.0)
@@ -394,7 +520,11 @@ async fn electron_request(
         }
 
         "getLocalFonts" => {
-            Ok(JsonValue::Array(vec![]))
+            let fonts: Vec<JsonValue> = get_local_fonts()
+                .into_iter()
+                .map(JsonValue::String)
+                .collect();
+            Ok(JsonValue::Array(fonts))
         }
 
         _ => Err(format!("Unknown electron action: {}", action)),
@@ -496,7 +626,21 @@ async fn electron_message(
             }
         }
 
-        "toggleSpellCheck" | "toggleStoreBkp" | "toggleGoogleFonts" => {}
+        "toggleGoogleFonts" => {
+            let state = app.state::<PrefsState>();
+            let mut prefs = state.prefs.lock().unwrap();
+            prefs.is_google_fonts_enabled = !prefs.is_google_fonts_enabled;
+            save_prefs(&prefs);
+        }
+
+        "toggleSpellCheck" => {
+            let state = app.state::<PrefsState>();
+            let mut prefs = state.prefs.lock().unwrap();
+            prefs.enable_spell_check = !prefs.enable_spell_check;
+            save_prefs(&prefs);
+        }
+
+        "toggleStoreBkp" => {}
 
         "newfile" => {
             window.eval("location.reload()").ok();

@@ -197,13 +197,22 @@ drawio webapp (ElectronApp.js)
 | **Print** | Not implemented | Electron uses `BrowserWindow.webContents.printToPDF()` + hidden window. Tauri/WebView2 has no equivalent. Options: (1) hidden `<iframe>` + SVG → `iframe.contentWindow.print()`, (2) Rust-side `resvg` + `printpdf` for native PDF → system print dialog |
 | **Export to PDF/PNG/SVG via server** | Stub (returns error) | Electron spawns hidden BrowserWindow with `export.js`. Tauri needs alternative rendering pipeline |
 | **System clipboard (image)** | Implemented | `writeImage`/`readImage` via `navigator.clipboard` + `ClipboardItem` API in bridge |
-| **File watching** | Implemented | `notify` crate watches files, emits `file-watch-changed` events via Tauri event system |
+| **File watching** | Implemented | Polling-based (std::thread, 2s interval), emits `file-watch-changed` events via `window.eval()` |
 | **Plugin management** | Not implemented | `installPlugin`/`uninstallPlugin`/`getPluginFile` return error |
-| **System font enumeration** | Not implemented | `getLocalFonts` returns empty array. Windows: `EnumFontFamiliesEx` via win32 API |
-| **Spell check toggle** | Stub | `toggleSpellCheck` no-op |
-| **Google Fonts toggle** | Stub | `toggleGoogleFonts` no-op |
+| **System font enumeration** | Implemented | Windows: `reg query` fonts registry. Linux: `fc-list`. macOS: `fc-list` + fallback to enumerating `/System/Library/Fonts`, `/Library/Fonts` |
+| **Spell check toggle** | Implemented | Persisted to `prefs.json`. WebView2 native spellcheck via MutationObserver overriding draw.io's hardcoded `spellcheck="false"` on text elements |
+| **Google Fonts toggle** | Implemented | Persisted to `prefs.json`. URL param `isGoogleFontsEnabled` set dynamically at startup |
 | **Store backup toggle** | Stub | `toggleStoreBkp` no-op |
-| **Check for updates** | Stub | `checkForUpdates` no-op |
+| **Check for updates** | Implemented | `ureq` fetches `api.github.com/repos/rede97/drawio-tauri/releases/latest`, semver comparison, dialog with "Download"→opens release page in browser |
 | **VSDX import via IPC** | Not implemented | Electron uses node.js to parse VSDX; Tauri needs Rust-side parser |
 | **Command-line file args** | Partial | `args-obj` emitted on startup but file-to-open flow not fully tested |
 | **Window zoom (native)** | Via CSS | `zoomIn`/`zoomOut`/`resetZoom` use `document.body.style.zoom` (not native) |
+
+### Prefs persistence
+
+User preferences stored as JSON at `<data_local_dir>/drawio/prefs.json`. Fields:
+
+- `googleFonts` (bool) — controlled by Extras → Google Fonts
+- `spellCheck` (bool) — controlled by Extras → Spell Check
+
+Toggling either shows "restart required" alert (webapp-side). New values take effect on next launch.
