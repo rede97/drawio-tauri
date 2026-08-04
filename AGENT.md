@@ -90,7 +90,7 @@ drawio-tauri/
 | `src-tauri/tauri.conf.json` | Window config, bundle targets, plugin settings, updater endpoint/pubkey, file associations |
 | `src-tauri/capabilities/default.json` | Security permissions for the main window |
 | `sync.cjs` | Pre-build script that syncs version from `drawio/VERSION` |
-| `scripts/release.ps1` | Release pipeline: build, sign bundles, generate `latest.json`, publish via `gh` |
+| `scripts/release.ps1` | CI-only release helper: sync version, tag `vX.Y.Z`, push (CI signs + publishes) |
 | `.github/workflows/build.yml` | CI/CD pipeline for Linux and Windows |
 
 ## Code Style
