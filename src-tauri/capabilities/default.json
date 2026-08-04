@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main"],
+  "windows": ["main", "win-*", "export-*"],
   "permissions": [
     "core:default",
     "dialog:default",

@@ -48,6 +48,8 @@ drawio-tauri/
 │       ├── fonts.rs           # System font enumeration
 │       ├── watcher.rs         # Polling-based file watching
 │       ├── update.rs          # Auto-update checks (tauri-plugin-updater)
+│       ├── windows.rs         # Editor window creation + bookkeeping (multi-window)
+│       ├── export.rs          # Local export pipeline (hidden export3.html renderer)
 │       └── electron_bridge.js # Init script: Electron→Tauri IPC bridge for the webapp
 ├── drawio/                    # Git submodule - core draw.io editor (jgraph/drawio, dev branch)
 │   └── src/main/webapp/       # Static webapp served by Tauri webview
@@ -86,6 +88,8 @@ drawio-tauri/
 | `src-tauri/src/fonts.rs` | System font enumeration |
 | `src-tauri/src/watcher.rs` | Polling file-watch thread |
 | `src-tauri/src/update.rs` | Startup + manual update checks via tauri-plugin-updater |
+| `src-tauri/src/windows.rs` | Editor window creation, labels, args routing (multi-window, single-instance) |
+| `src-tauri/src/export.rs` | Local export pipeline: hidden export3.html renderer window, print/svg/xml |
 | `src-tauri/src/electron_bridge.js` | Init script injected before page load; maps `electron.*` webapp API to Tauri IPC |
 | `src-tauri/tauri.conf.json` | Window config, bundle targets, plugin settings, updater endpoint/pubkey, file associations |
 | `src-tauri/capabilities/default.json` | Security permissions for the main window |
@@ -151,6 +155,7 @@ Defined in `src-tauri/src/ipc.rs`:
 - `tauri-plugin-opener` – Open URLs/files with system handler
 - `tauri-plugin-updater` – Signed auto-update checks + install (see below)
 - `tauri-plugin-window-state` – Persist/restore window size and position
+- `tauri-plugin-single-instance` – Forward second-launch file args to a new window
 
 ## Auto-Update
 
@@ -228,7 +233,7 @@ drawio webapp (ElectronApp.js)
 | `checkForUpdates` | Signed update check via tauri-plugin-updater (see Auto-Update section) |
 | `toggleGoogleFonts` / `toggleSpellCheck` | Persisted to `prefs.json`; take effect on next launch |
 | `toggleStoreBkp` | Persisted to `prefs.json`; affects subsequent saves immediately |
-| `newfile` | Reloads the webview (multi-window not implemented) |
+| `newfile` | Opens a new editor window (multi-window; args go to the first window only) |
 | `isModified-result` / `saveAndClose-result` / `draftRemoved` | Close-confirm handshake (see below) |
 
 ### Close-Confirm Handshake (mirrors drawio-desktop)
@@ -250,7 +255,32 @@ window close / File → Exit
         Cancel  → abort close, clear pending id
 ```
 
-Rust→JS push functions exposed by the bridge: `__tauriCloseCheck(id)`, `__tauriSaveAndClose(id)`, `__tauriRemoveDraft()`, `__tauriFileChanged(payload)`, `__tauriArgsObj(payload)`, `__tauriExportError(payload)`.
+Rust→JS push functions exposed by the bridge: `__tauriCloseCheck(id)`, `__tauriSaveAndClose(id)`, `__tauriRemoveDraft()`, `__tauriFileChanged(payload)`, `__tauriArgsObj(payload)`, `__tauriRender(args)`, `__tauriGetSvgData()`, `__tauriExportReply(channel, data)`.
+
+### Multi-Window & Single Instance
+
+- File → New Window (`newfile`) creates another editor window (`win-N` labels); every window gets the bridge script and its own close-confirm handshake (`CloseState` keyed by window label)
+- File-watch events route to the owning window; watches of destroyed windows are dropped
+- Command-line file args go to the first window; additional windows start with the splash
+- Single instance (mirrors drawio-desktop): a second launch — e.g. double-clicking another `.drawio` — spawns a new window in the running instance and forwards the file via queued `args-obj`
+
+### Local Export Pipeline (print/svg/xml)
+
+Mirrors drawio-desktop's `exportDiagram()` with a hidden `export-N` window loading `export3.html`:
+
+```
+webapp sendMessage('export', args)
+  → Rust spawns hidden renderer window (same bridge script)
+  → renderer signals 'export-renderer-ready' → Rust evals __tauriRender(args)
+  → export.js renders pages, replies 'render-finished' (bounds-checked)
+  → print: window shown, @page CSS + body zoom injected, window.print(),
+           'print-after' (afterprint) ends the job
+    svg:   __tauriGetSvgData() → 'svg-data' reply
+    xml:   'xml-data' reply (renderer pushes on its own)
+  → Rust forwards 'export-success'/'export-error' to the requesting window
+```
+
+Print approximates Electron's `printToPDF` options with CSS: `@page size` ≈ preferCSSPageSize, `body zoom` ≈ scaleFactor = 100/pageScale [jgraph/drawio#5540]. png/jpg/pdf **file** output needs webview capture/printToPDF equivalents Tauri does not expose; those formats still return an error.
 
 ### File Conventions (mirror drawio-desktop)
 
@@ -295,12 +325,13 @@ Injected via `with_initialization_script()` before webapp loads. Besides the cor
 | Store backup toggle | Implemented | Since 31.1.5 sync |
 | Check for updates | Implemented | tauri-plugin-updater, signed artifacts from GitHub releases |
 | Command-line file args | Implemented | `args-obj` emitted on `app-load-finished` |
+| Multi-window (File → New Window) | Implemented | `win-N` labels, per-window close handshake |
+| Single instance | Implemented | Second launch forwards file to a new window |
+| Print | Implemented | Hidden export3.html renderer + system print dialog |
 | Window size/position memory | Implemented | tauri-plugin-window-state, restores on launch |
 | Window zoom | Via CSS | Not native webContents zoom |
-| **Print** | Not implemented | Electron uses `BrowserWindow.webContents.printToPDF()` + hidden window; no Tauri/WebView2 equivalent. Options: hidden `<iframe>` + `print()`, or Rust-side `resvg` + `printpdf` |
-| **Export to PDF/PNG/SVG via local pipeline** | Stub | Electron spawns hidden BrowserWindow with `export.js`; needs alternative rendering pipeline |
+| **Export to PDF/PNG/SVG via local pipeline** | Partial | print/svg/xml local via export3.html renderer; png/jpg/pdf file output still stub (needs webview capture) |
 | **Plugin management** | Not implemented | `installPlugin`/`uninstallPlugin`/`getPluginFile` return error |
-| **Multi-window** | Not implemented | Official keeps a windows registry; `newfile` reloads the single window |
 | **Native application menu** | Not implemented | Webapp renders its own menu bar (sufficient) |
 | **VSDX import via IPC** | Not implemented | Electron uses node.js to parse VSDX; needs Rust-side parser |
 | `windowAction` / `isFullscreen` / `checkFileExists` | Not implemented | Present in official main but not called by webapp 31.1.5 |
@@ -345,6 +376,7 @@ Injected via `with_initialization_script()` before webapp loads. Besides the cor
 | `tauri-plugin-opener` | Open URLs with system handler |
 | `tauri-plugin-updater` | Signed auto-update |
 | `tauri-plugin-window-state` | Window size/position persistence |
+| `tauri-plugin-single-instance` | Single instance + second-launch forwarding |
 | `serde` / `serde_json` | Serialization |
 | `dirs` | OS standard directories |
 | `base64` | File encoding support |

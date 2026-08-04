@@ -234,4 +234,12 @@ window.DRAWIO_CONFIG = { enableLocalFonts: true };
 			});
 		}
 	})();
+
+	// export3.html renderer: tell Rust that export.js has registered its
+	// listeners (all classic head scripts have run by window load)
+	if (_isExportRenderer) {
+		window.addEventListener('load', function() {
+			window.electron.sendMessage('export-renderer-ready', {});
+		});
+	}
 })();

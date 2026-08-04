@@ -5,7 +5,7 @@
 //! - `electron.request()`  → [`electron_request`]
 //! - `electron.sendMessage()` → [`electron_message`]
 
-use crate::{close_flow, drafts, fonts, prefs, update, watcher};
+use crate::{close_flow, drafts, export, fonts, prefs, update, watcher, windows};
 use base64::Engine;
 use prefs::{PrefField, PrefsState};
 use serde_json::Value as JsonValue;
@@ -40,6 +40,7 @@ pub fn getapp_version() -> String {
 pub async fn electron_request(
     msg: JsonValue,
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, FileWatchState>,
     prefs_state: tauri::State<'_, PrefsState>,
 ) -> Result<JsonValue, String> {
@@ -68,9 +69,9 @@ pub async fn electron_request(
             Ok(JsonValue::Null)
         }
 
-        "showSaveDialog" => show_save_dialog(&app, &msg),
+        "showSaveDialog" => show_save_dialog(&app, &window, &msg),
 
-        "showOpenDialog" => show_open_dialog(&app, &msg),
+        "showOpenDialog" => show_open_dialog(&app, &window, &msg),
 
         "readFile" => {
             let filename = msg["filename"].as_str().ok_or("missing filename")?;
@@ -142,11 +143,10 @@ pub async fn electron_request(
             }
         }
 
-        // File → Exit: run the window through the normal close-confirm flow
+        // File → Exit: run the requesting window through the normal
+        // close-confirm flow
         "exit" => {
-            if let Some(win) = app.get_webview_window("main") {
-                win.close().map_err(|e| e.to_string())?;
-            }
+            window.close().map_err(|e| e.to_string())?;
             Ok(JsonValue::Null)
         }
 
@@ -224,7 +224,7 @@ pub async fn electron_request(
                     let mtime = meta.modified().ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_millis() as u64);
-                    state.watch_path(path, mtime);
+                    state.watch_path(path, mtime, window.clone());
                 }
             }
             Ok(JsonValue::Null)
@@ -264,27 +264,22 @@ pub async fn electron_request(
         // goes through the normal close-confirm handshake.
         "windowAction" => {
             let method = msg["method"].as_str().unwrap_or("");
-            if let Some(win) = app.get_webview_window("main") {
-                match method {
-                    "minimize" => win.minimize().map_err(|e| e.to_string())?,
-                    "maximize" => win.maximize().map_err(|e| e.to_string())?,
-                    "unmaximize" => win.unmaximize().map_err(|e| e.to_string())?,
-                    "close" => win.close().map_err(|e| e.to_string())?,
-                    "isMaximized" => {
-                        return Ok(JsonValue::Bool(win.is_maximized().unwrap_or(false)));
-                    }
-                    // removeAllListeners and unknown methods: no-op
-                    _ => {}
+            match method {
+                "minimize" => window.minimize().map_err(|e| e.to_string())?,
+                "maximize" => window.maximize().map_err(|e| e.to_string())?,
+                "unmaximize" => window.unmaximize().map_err(|e| e.to_string())?,
+                "close" => window.close().map_err(|e| e.to_string())?,
+                "isMaximized" => {
+                    return Ok(JsonValue::Bool(window.is_maximized().unwrap_or(false)));
                 }
+                // removeAllListeners and unknown methods: no-op
+                _ => {}
             }
             Ok(JsonValue::Null)
         }
 
         "isFullscreen" => {
-            let fs = app.get_webview_window("main")
-                .map(|w| w.is_fullscreen().unwrap_or(false))
-                .unwrap_or(false);
-            Ok(JsonValue::Bool(fs))
+            Ok(JsonValue::Bool(window.is_fullscreen().unwrap_or(false)))
         }
 
         _ => Err(format!("Unknown electron action: {}", action)),
@@ -303,6 +298,11 @@ pub async fn electron_message(
 ) -> Result<(), String> {
     // Close-confirm handshake channels are handled by the close_flow module
     if close_flow::handle_message(&channel, &data, &app, &window) {
+        return Ok(());
+    }
+
+    // Export pipeline channels (editor 'export' + export-N renderer events)
+    if export::handle_message(&channel, &data, &app, &window) {
         return Ok(());
     }
 
@@ -330,21 +330,23 @@ pub async fn electron_message(
         }
 
         "app-load-finished" => {
-            let args: Vec<String> = std::env::args().skip(1).collect();
+            // Args routing: second-instance file args (queued per spawned
+            // window) take priority; command-line args go to the first
+            // editor window only; other windows start with the splash
+            let ws = app.state::<windows::WindowsState>();
+            let args: Vec<String> = if let Some(args) = ws.take_pending_args() {
+                args
+            } else if ws.take_first_window_args() {
+                std::env::args().skip(1).collect()
+            } else {
+                Vec::new()
+            };
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
             let payload = serde_json::json!({ "args": args, "cwd": cwd });
             let js = format!("window.__tauriArgsObj({})", payload);
             window.eval(&js).ok();
             // Override Help → Website link to fork homepage
             window.eval("try{var a=editorUi&&editorUi.actions;if(a){a.addAction('website...',function(){editorUi.openLink('https://github.com/rede97/drawio-tauri')})}}catch(e){}").ok();
-        }
-
-        "export" => {
-            let payload = serde_json::json!({
-                "message": "Export via Tauri bridge not yet implemented. Use browser export."
-            });
-            let js = format!("window.__tauriExportError({})", payload);
-            window.eval(&js).ok();
         }
 
         "checkForUpdates" => {
@@ -357,8 +359,11 @@ pub async fn electron_message(
 
         "toggleStoreBkp" => app.state::<PrefsState>().toggle(PrefField::StoreBkp),
 
+        // File → New Window: open another editor window (mirrors
+        // drawio-desktop's windows registry)
         "newfile" => {
-            window.eval("location.reload()").ok();
+            let width = data["width"].as_f64();
+            windows::create_editor_window(&app, None, width).map_err(|e| e.to_string())?;
         }
 
         _ => {}
@@ -387,9 +392,9 @@ fn apply_filters(
     builder
 }
 
-fn show_save_dialog(app: &tauri::AppHandle, msg: &JsonValue) -> Result<JsonValue, String> {
+fn show_save_dialog(app: &tauri::AppHandle, window: &tauri::WebviewWindow, msg: &JsonValue) -> Result<JsonValue, String> {
     let mut builder = app.dialog().file();
-    builder = builder.set_parent(&app.get_webview_window("main").unwrap());
+    builder = builder.set_parent(window);
     if let Some(title) = msg["title"].as_str() {
         builder = builder.set_title(title);
     }
@@ -412,9 +417,9 @@ fn show_save_dialog(app: &tauri::AppHandle, msg: &JsonValue) -> Result<JsonValue
     }
 }
 
-fn show_open_dialog(app: &tauri::AppHandle, msg: &JsonValue) -> Result<JsonValue, String> {
+fn show_open_dialog(app: &tauri::AppHandle, window: &tauri::WebviewWindow, msg: &JsonValue) -> Result<JsonValue, String> {
     let mut builder = app.dialog().file();
-    builder = builder.set_parent(&app.get_webview_window("main").unwrap());
+    builder = builder.set_parent(window);
     if let Some(title) = msg["title"].as_str() {
         builder = builder.set_title(title);
     }

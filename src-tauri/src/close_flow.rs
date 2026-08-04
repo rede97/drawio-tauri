@@ -17,6 +17,7 @@
 //! ```
 
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
@@ -24,32 +25,33 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
 pub struct CloseState {
-    /// Unique id of the in-flight close handshake (None = no close pending)
-    pending_unique_id: Mutex<Option<String>>,
+    /// window label → unique id of the in-flight close handshake
+    /// (absent = no close pending for that window)
+    pending: Mutex<HashMap<String, String>>,
 }
 
 impl CloseState {
     pub fn new() -> Self {
-        Self { pending_unique_id: Mutex::new(None) }
+        Self { pending: Mutex::new(HashMap::new()) }
     }
 
-    /// Take the pending id only if it matches `id` (validates the handshake)
-    fn take_if_matches(&self, id: &str) -> bool {
-        let mut pending = self.pending_unique_id.lock().unwrap();
-        if pending.as_deref() == Some(id) {
-            *pending = None;
+    /// Take the pending id of `label` only if it matches `id`
+    fn take_if_matches(&self, label: &str, id: &str) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.get(label).map(String::as_str) == Some(id) {
+            pending.remove(label);
             true
         } else {
             false
         }
     }
 
-    fn clear(&self) {
-        *self.pending_unique_id.lock().unwrap() = None;
+    fn clear(&self, label: &str) {
+        self.pending.lock().unwrap().remove(label);
     }
 
-    fn is_pending(&self, id: &str) -> bool {
-        self.pending_unique_id.lock().unwrap().as_deref() == Some(id)
+    fn is_pending(&self, label: &str, id: &str) -> bool {
+        self.pending.lock().unwrap().get(label).map(String::as_str) == Some(id)
     }
 }
 
@@ -62,21 +64,22 @@ fn new_unique_id() -> String {
     format!("{:x}{:x}", nanos, std::process::id())
 }
 
-/// Wire the CloseRequested handler on the main window: every close request is
-/// intercepted and routed through the isModified handshake with the webapp.
+/// Wire the CloseRequested handler on an editor window: every close request
+/// is intercepted and routed through the isModified handshake with the webapp.
 pub fn register_close_handler(window: &tauri::WebviewWindow) {
     let win_close = window.clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
             let unique_id = new_unique_id();
+            let label = win_close.label().to_string();
             {
                 let state = win_close.app_handle().state::<CloseState>();
-                let mut pending = state.pending_unique_id.lock().unwrap();
-                if pending.is_some() {
-                    return; // close flow already in progress
+                let mut pending = state.pending.lock().unwrap();
+                if pending.contains_key(&label) {
+                    return; // close flow already in progress for this window
                 }
-                *pending = Some(unique_id.clone());
+                pending.insert(label, unique_id.clone());
             }
             win_close.eval(&format!("window.__tauriCloseCheck('{}')", unique_id)).ok();
         }
@@ -95,9 +98,10 @@ pub fn handle_message(
         // Step 2: webapp answered "isModified"
         "isModified-result" => {
             let unique_id = data["uniqueId"].as_str().unwrap_or("");
+            let label = window.label().to_string();
             {
                 let state = app.state::<CloseState>();
-                if !state.is_pending(unique_id) {
+                if !state.is_pending(&label, unique_id) {
                     return true; // stale or unsolicited reply
                 }
             }
@@ -118,7 +122,7 @@ pub fn handle_message(
                         window.eval(&format!("window.__tauriSaveAndClose('{}')", unique_id)).ok();
                     }
                     tauri_plugin_dialog::MessageDialogResult::No => {
-                        app.state::<CloseState>().clear();
+                        app.state::<CloseState>().clear(&label);
                         // Discard: remove the draft, then destroy the window
                         if let Some(draft_path) = data["draftPath"].as_str() {
                             if Path::new(draft_path).exists() {
@@ -132,11 +136,11 @@ pub fn handle_message(
                     }
                     _ => {
                         // Cancel: abort close
-                        app.state::<CloseState>().clear();
+                        app.state::<CloseState>().clear(&label);
                     }
                 }
             } else {
-                app.state::<CloseState>().clear();
+                app.state::<CloseState>().clear(&label);
                 window.destroy().ok();
             }
             true
@@ -147,18 +151,18 @@ pub fn handle_message(
             let unique_id = data["uniqueId"].as_str().unwrap_or("");
             let success = data["success"].as_bool().unwrap_or(false);
             let state = app.state::<CloseState>();
-            if success && state.take_if_matches(unique_id) {
+            if success && state.take_if_matches(window.label(), unique_id) {
                 window.destroy().ok();
             } else {
                 // Save failed or was cancelled (Save As dialog aborted): stay open
-                state.clear();
+                state.clear(window.label());
             }
             true
         }
 
         // Final step (Discard chosen): draft removed
         "draftRemoved" => {
-            app.state::<CloseState>().clear();
+            app.state::<CloseState>().clear(window.label());
             window.destroy().ok();
             true
         }
