@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/main/nicegui/json_schemas/tauri-conf-v2.json",
   "productName": "draw.io",
-  "version": "29.7.13",
+  "version": "31.1.5",
   "identifier": "com.jgraph.drawio",
   "build": {
     "beforeBuildCommand": "npm run sync",
@@ -75,6 +75,16 @@
     },
     "shell": {
       "open": true
+    },
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/rede97/drawio-tauri/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkyQzFFMzVDMTMyQTZERTgKUldUb2JTb1RYT1BCa2kybmRzVWU0ZmxVUW96K1N1K2R3dHc2Z1FvakJtQlJic1g2NFVJSXVTeGIK",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

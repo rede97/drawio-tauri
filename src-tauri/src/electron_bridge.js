@@ -27,7 +27,7 @@ window.DRAWIO_CONFIG = { enableLocalFonts: true };
 (function() {
 	var _ua = navigator.userAgent;
 	Object.defineProperty(navigator, 'userAgent', {
-		get: function() { return _ua + ' electron/29.7.11 draw.io/29.7.11'; }
+		get: function() { return _ua + ' electron/tauri draw.io/__DRAWIO_VERSION__'; }
 	});
 
 	window.process = { versions: { electron: 'tauri' } };
@@ -52,19 +52,6 @@ window.DRAWIO_CONFIG = { enableLocalFonts: true };
 		if (cb) {
 			try { cb(payload.curr, payload.prev); } catch(e) {}
 		}
-	}];
-
-	// save-and-close event: trigger save, then signal Rust to close window
-	_listeners['save-and-close'] = [function() {
-		var editorUi = window.editorUi;
-		if (!editorUi) { window.electron.sendMessage('save-complete'); return; }
-		var file = editorUi.getCurrentFile();
-		if (!file) { window.electron.sendMessage('save-complete'); return; }
-		file.save(false, function() {
-			window.electron.sendMessage('save-complete');
-		}, function() {
-			window.electron.sendMessage('save-complete');
-		});
 	}];
 
 	function _dataUrlToBlob(dataUrl) {
@@ -94,9 +81,12 @@ window.DRAWIO_CONFIG = { enableLocalFonts: true };
 	}
 
 	// Bridge functions callable from Rust via window.eval()
-	// Each maps to _emit() which dispatches to registered listeners
-	window.__tauriCloseCheck = function() { _emit('isModified', 'close-check'); };
-	window.__tauriSaveAndClose = function() { _emit('save-and-close'); };
+	// Each maps to _emit() which dispatches to registered listeners.
+	// Close handshake mirrors drawio-desktop: the webapp registers
+	// isModified / saveAndClose / removeDraft listeners in ElectronApp.js.
+	window.__tauriCloseCheck = function(uniqueId) { _emit('isModified', uniqueId); };
+	window.__tauriSaveAndClose = function(uniqueId) { _emit('saveAndClose', uniqueId); };
+	window.__tauriRemoveDraft = function() { _emit('removeDraft', {}); };
 	window.__tauriFileChanged = function(data) { _emit('file-watch-changed', data); };
 	window.__tauriArgsObj = function(data) { _emit('args-obj', data); };
 	window.__tauriExportError = function(data) { _emit('export-error', data); };
