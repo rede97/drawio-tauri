@@ -65,6 +65,14 @@
         ],
         "mimeType": "application/vnd.visio",
         "name": "Visio Document"
+      },
+      {
+        "ext": [
+          "mmd",
+          "mermaid"
+        ],
+        "mimeType": "text/vnd.mermaid",
+        "name": "Mermaid Diagram"
       }
     ]
   },

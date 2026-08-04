@@ -150,6 +150,7 @@ Defined in `src-tauri/src/ipc.rs`:
 - `tauri-plugin-shell` – Open URLs in default browser
 - `tauri-plugin-opener` – Open URLs/files with system handler
 - `tauri-plugin-updater` – Signed auto-update checks + install (see below)
+- `tauri-plugin-window-state` – Persist/restore window size and position
 
 ## Auto-Update
 
@@ -212,6 +213,9 @@ drawio webapp (ElectronApp.js)
 | `isPluginsEnabled` | Returns `true` |
 | `exit` | File → Exit; closes the window through the normal close-confirm flow |
 | `getPluginFile` / `installPlugin` / `uninstallPlugin` | Stub (returns error) — plugin management not implemented |
+| `checkFileExists` | Joins `pathParts`, returns `{exists, path}` |
+| `windowAction` | minimize/maximize/unmaximize/isMaximized; `close` goes through the close-confirm flow |
+| `isFullscreen` | Returns current fullscreen state |
 
 ### Implemented `electron.sendMessage()` Channels
 
@@ -291,6 +295,7 @@ Injected via `with_initialization_script()` before webapp loads. Besides the cor
 | Store backup toggle | Implemented | Since 31.1.5 sync |
 | Check for updates | Implemented | tauri-plugin-updater, signed artifacts from GitHub releases |
 | Command-line file args | Implemented | `args-obj` emitted on `app-load-finished` |
+| Window size/position memory | Implemented | tauri-plugin-window-state, restores on launch |
 | Window zoom | Via CSS | Not native webContents zoom |
 | **Print** | Not implemented | Electron uses `BrowserWindow.webContents.printToPDF()` + hidden window; no Tauri/WebView2 equivalent. Options: hidden `<iframe>` + `print()`, or Rust-side `resvg` + `printpdf` |
 | **Export to PDF/PNG/SVG via local pipeline** | Stub | Electron spawns hidden BrowserWindow with `export.js`; needs alternative rendering pipeline |
@@ -339,6 +344,7 @@ Injected via `with_initialization_script()` before webapp loads. Besides the cor
 | `tauri-plugin-shell` | Shell/URL opening |
 | `tauri-plugin-opener` | Open URLs with system handler |
 | `tauri-plugin-updater` | Signed auto-update |
+| `tauri-plugin-window-state` | Window size/position persistence |
 | `serde` / `serde_json` | Serialization |
 | `dirs` | OS standard directories |
 | `base64` | File encoding support |

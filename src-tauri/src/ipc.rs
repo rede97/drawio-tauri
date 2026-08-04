@@ -248,6 +248,45 @@ pub async fn electron_request(
             Ok(JsonValue::Array(font_list))
         }
 
+        // Joins path parts and reports existence (mirrors drawio-desktop)
+        "checkFileExists" => {
+            let parts: Vec<String> = msg["pathParts"].as_array()
+                .map(|a| a.iter().filter_map(|p| p.as_str().map(String::from)).collect())
+                .ok_or("missing pathParts")?;
+            let path: PathBuf = parts.iter().collect();
+            Ok(serde_json::json!({
+                "exists": path.exists(),
+                "path": path.to_string_lossy()
+            }))
+        }
+
+        // Window controls (mirrors drawio-desktop windowAction). 'close'
+        // goes through the normal close-confirm handshake.
+        "windowAction" => {
+            let method = msg["method"].as_str().unwrap_or("");
+            if let Some(win) = app.get_webview_window("main") {
+                match method {
+                    "minimize" => win.minimize().map_err(|e| e.to_string())?,
+                    "maximize" => win.maximize().map_err(|e| e.to_string())?,
+                    "unmaximize" => win.unmaximize().map_err(|e| e.to_string())?,
+                    "close" => win.close().map_err(|e| e.to_string())?,
+                    "isMaximized" => {
+                        return Ok(JsonValue::Bool(win.is_maximized().unwrap_or(false)));
+                    }
+                    // removeAllListeners and unknown methods: no-op
+                    _ => {}
+                }
+            }
+            Ok(JsonValue::Null)
+        }
+
+        "isFullscreen" => {
+            let fs = app.get_webview_window("main")
+                .map(|w| w.is_fullscreen().unwrap_or(false))
+                .unwrap_or(false);
+            Ok(JsonValue::Bool(fs))
+        }
+
         _ => Err(format!("Unknown electron action: {}", action)),
     }
 }
