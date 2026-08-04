@@ -1,98 +1,68 @@
-# Release script for draw.io Tauri (Windows)
+# CI-only release helper for draw.io Tauri
 #
-# Builds the app, signs the NSIS bundle for the auto-updater, generates
-# latest.json, and publishes everything to a GitHub release via `gh`.
+# Releases are built, signed, and published by GitHub Actions
+# (.github/workflows/build.yml) using the TAURI_SIGNING_PRIVATE_KEY repo
+# secret. The private key is intentionally NOT stored on this machine —
+# GitHub secrets are write-only, so CI is the single copy.
 #
-# Prerequisites:
-#   - gh CLI authenticated (gh auth login), repo + workflow scopes
-#   - Signing private key at $env:USERPROFILE\.tauri\drawio-tauri.key
-#     (generated once via: cargo tauri signer generate -w ~/.tauri/drawio-tauri.key)
-#   - Node.js >= 20 and Rust stable on PATH
+# What this script does locally:
+#   1. npm run sync           (drawio/VERSION -> package.json, Cargo.toml, tauri.conf.json)
+#   2. git tag vX.Y.Z         (annotated)
+#   3. git push origin vX.Y.Z (triggers the CI release pipeline)
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File scripts\release.ps1 [-Draft]
+#   powershell -ExecutionPolicy Bypass -File scripts\release.ps1 [-Push]
 #
-# The updater endpoint in tauri.conf.json points to:
-#   https://github.com/rede97/drawio-tauri/releases/latest/download/latest.json
-# so publishing (non-draft) a newer version makes it available to all clients.
+# Without -Push it only prints the steps (dry run).
 
 param(
-    [switch]$Draft
+    [switch]$Push
 )
 
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
-$repo   = 'rede97/drawio-tauri'
-$keyDir = Join-Path $env:USERPROFILE '.tauri'
-$keyFile = Join-Path $keyDir 'drawio-tauri.key'
+$repo = 'rede97/drawio-tauri'
 
-# ── Pre-flight checks ──────────────────────────────────────────────────────
-if (-not (Test-Path $keyFile)) {
-    throw "Signing key not found: $keyFile`nGenerate it once with: cargo tauri signer generate -w ~/.tauri/drawio-tauri.key"
-}
-if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-    throw "gh CLI not found on PATH"
-}
-gh auth status | Out-Null
-
-# ── Version (source of truth: drawio/VERSION) ─────────────────────────────
+# ── Sync version (source of truth: drawio/VERSION) ────────────────────────
 npm run sync | Out-Null
 $version = (Get-Content 'drawio/VERSION').Trim()
 $tag = "v$version"
-Write-Host "==> Releasing $tag" -ForegroundColor Cyan
 
-# ── Build + sign (tauri picks up the signing env vars automatically) ───────
-# createUpdaterArtifacts is injected via --config so plain dev builds without
-# the private key keep working.
-$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content $keyFile -Raw
-$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ''
-
-$overrideFile = Join-Path $env:TEMP 'tauri-updater-override.json'
-'{"bundle":{"createUpdaterArtifacts":true}}' | Set-Content $overrideFile -Encoding utf8
-
-cargo tauri build --bundles nsis -c $overrideFile
-if ($LASTEXITCODE -ne 0) { throw 'cargo tauri build failed' }
-
-$setupExe = "src-tauri/target/release/bundle/nsis/draw.io_${version}_x64-setup.exe"
-$sigFile  = "$setupExe.sig"
-if (-not (Test-Path $setupExe)) { throw "Bundle not found: $setupExe" }
-if (-not (Test-Path $sigFile))  { throw "Signature not found: $sigFile (was TAURI_SIGNING_PRIVATE_KEY picked up?)" }
-
-# ── latest.json (updater manifest) ─────────────────────────────────────────
-$signature = (Get-Content $sigFile -Raw).Trim()
-$pubDate = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-$latest = [ordered]@{
-    version  = $version
-    notes    = "See https://github.com/$repo/releases/tag/$tag"
-    pub_date = $pubDate
-    platforms = [ordered]@{
-        'windows-x86_64' = [ordered]@{
-            signature = $signature
-            url       = "https://github.com/$repo/releases/download/$tag/draw.io_${version}_x64-setup.exe"
-        }
-    }
+# ── Pre-flight: tag must not already exist on the remote ──────────────────
+$existing = git ls-remote --tags origin $tag 2>$null
+if ($existing) {
+    throw "Tag $tag already exists on origin. Bump drawio/VERSION first (update the submodule)."
 }
-$latestPath = 'src-tauri/target/release/bundle/latest.json'
-$latest | ConvertTo-Json -Depth 5 | Set-Content $latestPath -Encoding utf8
-Write-Host "==> latest.json written" -ForegroundColor Cyan
 
-# ── Publish via gh ─────────────────────────────────────────────────────────
-$assets = @($setupExe, $sigFile, $latestPath)
-$existing = gh release view $tag --repo $repo 2>$null
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "==> Release $tag exists, uploading assets (clobber)" -ForegroundColor Yellow
-    gh release upload $tag @assets --repo $repo --clobber
-} else {
-    $createArgs = @('release', 'create', $tag, '--repo', $repo,
-                    '--title', "draw.io $version", '--generate-notes')
-    if ($Draft) { $createArgs += '--draft' }
-    gh @createArgs @assets
-}
-if ($LASTEXITCODE -ne 0) { throw 'gh release failed' }
+Write-Host "==> Release candidate: $tag" -ForegroundColor Cyan
 
-if ($Draft) {
-    Write-Host "==> Draft release $tag created. Publish it on GitHub to ship the update." -ForegroundColor Green
-} else {
-    Write-Host "==> Release $tag published. Clients will auto-update on next startup." -ForegroundColor Green
+if (-not $Push) {
+    Write-Host @"
+
+Dry run. To release ${tag}:
+
+    git add -A; git commit -m "release $version"
+    git push origin dev
+    git tag -a $tag -m "draw.io $version"
+    git push origin $tag
+
+The tag push triggers CI: build -> sign NSIS updater artifacts -> generate
+latest.json -> publish the GitHub release (clients auto-update afterwards).
+Or re-run this script with -Push to execute the tag + push steps.
+"@
+    exit 0
 }
+
+# ── Tag + push ─────────────────────────────────────────────────────────────
+$dirty = git status --porcelain
+if ($dirty) {
+    throw "Working tree is dirty. Commit and push your changes to dev first:`n$dirty"
+}
+
+git tag -a $tag -m "draw.io $version"
+git push origin $tag
+if ($LASTEXITCODE -ne 0) { throw "Failed to push $tag" }
+
+Write-Host "==> $tag pushed. CI is building the release:" -ForegroundColor Green
+Write-Host "    https://github.com/$repo/actions"

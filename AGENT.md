@@ -55,7 +55,7 @@ drawio-tauri/
 │   ├── drawio/                #   jgraph/drawio @ 31.1.5
 │   └── drawio-desktop-ref/    #   jgraph/drawio-desktop (official Electron main process)
 ├── scripts/
-│   └── release.ps1            # Build + sign + latest.json + gh release publish
+│   └── release.ps1            # CI-only release helper: sync version, tag, push (CI signs + publishes)
 ├── .github/workflows/
 │   └── build.yml              # CI/CD: Linux + Windows builds, releases
 ├── package.json               # Tauri JS plugin deps (@tauri-apps/*)
@@ -165,16 +165,16 @@ Implemented with `tauri-plugin-updater` (minisign-signed artifacts):
 |------|----------|
 | Endpoint | `tauri.conf.json` → `plugins.updater.endpoints` → `.../releases/latest/download/latest.json` |
 | Public key | `tauri.conf.json` → `plugins.updater.pubkey` |
-| Private key | `~/.tauri/drawio-tauri.key` — **never commit; losing it breaks future updates** |
-| Signing | `bundle.createUpdaterArtifacts: true` + env `TAURI_SIGNING_PRIVATE_KEY(_PATH)` at build time |
+| Private key | **GitHub repo secret `TAURI_SIGNING_PRIVATE_KEY` only** — CI-only by design; GitHub secrets are write-only (no local copy exists). If the secret is lost, existing installs can never auto-update again |
+| Signing | CI injects `bundle.createUpdaterArtifacts: true` via `--config` at build time, so local dev builds never need the key |
 
-### Releasing (uses `gh` CLI)
+### Releasing (CI-only)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\release.ps1 [-Draft]
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Push
 ```
 
-The script: syncs version → `cargo tauri build --bundles nsis` with signing env vars → generates `latest.json` (version, pub_date, windows-x86_64 signature + asset URL) → `gh release create vX.Y.Z` uploading the NSIS setup, `.sig`, and `latest.json`. Publishing a release whose tag is newer than the client's version triggers auto-update on the client's next startup. For CI, add `TAURI_SIGNING_PRIVATE_KEY` (and password) as GitHub secrets.
+The script syncs the version, then tags `vX.Y.Z` and pushes it. The tag push triggers the CI pipeline: build → sign NSIS updater artifacts → generate `latest.json` → publish the GitHub release. Clients auto-update on their next startup after the release is published.
 
 ## Electron Bridge (Desktop Mode)
 
@@ -318,7 +318,7 @@ Injected via `with_initialization_script()` before webapp loads. Besides the cor
 6. **Rust stable required** for Tauri compilation
 7. **Linux system deps required** – WebKit2GTK, GTK3, etc. (see DEVELOPMENT.md)
 8. **Keep IPC surface aligned with webapp** – When bumping the drawio submodule, diff `drawio/src/main/webapp/js/diagramly/ElectronApp.js` actions/messages against `src-tauri/src/ipc.rs` and `electron_bridge.js`; use `temp/drawio-desktop-ref/src/main/electron.js` (official Electron main) as the behavioral reference
-9. **Never commit the updater private key** – `~/.tauri/drawio-tauri.key`; losing it means existing installs can never auto-update again
+9. **Updater private key lives only in the GitHub secret** – `TAURI_SIGNING_PRIVATE_KEY` is the single copy (CI-only policy); secrets are write-only, so if it is deleted, existing installs can never auto-update again
 
 ## Development Tips
 
